@@ -6,8 +6,13 @@ const fetch = require("node-fetch");
 const { Readable } = require("stream");
 const IcalExpander = require("ical-expander");
 const fs = require("fs");
+const path = require("path");
 const { DateTime } = require("luxon");
 const argv = require("minimist")(process.argv.slice(2));
+const { v4 } = require("uuid");
+const moment = require("moment");
+const _ = require("lodash");
+
 
 const RC = argv.c || `${process.env.HOME}/.icsorgrc`;
 require("dotenv").config({ path: RC });
@@ -178,37 +183,57 @@ function makeMailtoLink(data) {
   return data;
 }
 
+function makeFullName(data) {
+  if (data && data.startsWith("mailto:")) {
+    data = data.substring(7);
+  }
+
+  const matches = data.match(/(\w+)\.(\w+)@.+?$/);
+  if (matches && matches.length === 3) {
+    data = `${_.capitalize(matches[1])} ${_.capitalize(matches[2])}`;
+  }
+
+  return `[[${data}][${data}]]`;
+}
+
 /**
  * dumps out an event to the specified read stream
  *
  * @param {Object} e - event object
  * @param {stream} rs - stream to push data onto
  */
-function dumpEvent(e, rs) {
-  rs.push(`* ${e.summary}\n`);
+function dumpEvent(e, rs, isRoam = false) {
+  if (!isRoam)
+    rs.push(`* ${e.summary}\n`);
   rs.push(":PROPERTIES:\n");
   rs.push(":ICAL_EVENT:    t\n");
-  rs.push(`:ID:            ${e.uid}\n`);
+  rs.push(`:ID:            ${e.id}\n`);
   e.organizer
-    ? rs.push(`:ORGANIZER:     ${makeMailtoLink(e.organizer)}\n`)
-    : null;
-  e.status ? rs.push(`:STATUS:        ${e.status}\n`) : null;
+    && rs.push(`:ORGANIZER:     ${makeFullName(e.organizer)}\n`);
+  e.status && rs.push(`:STATUS:        ${e.status}\n`);
   e.modified
-    ? rs.push(`:LAST_MODIFIED: ${makeTimestamp(e.modified, "inactive")}\n`)
-    : null;
-  e.location ? rs.push(`:LOCATION:      ${e.location}\n`) : null;
-  e.duration ? rs.push(`:DURATION:      ${parseDuration(e.duration)}\n`) : null;
+    && rs.push(`:LAST_MODIFIED: ${makeTimestamp(e.modified, "inactive")}\n`);
+  if (isRoam) {
+    e.startDate && rs.push(`:START_DATE:    ${makeTimestamp(e.startDate)}\n`);
+    e.endDate && rs.push(`:END_DATE:      ${makeTimestamp(e.endDate)}\n`);
+  }
+  e.location && rs.push(`:LOCATION:      ${e.location}\n`);
+  e.duration && rs.push(`:DURATION:      ${parseDuration(e.duration)}\n`);
   e.attendees.length
     ? rs.push(
-        `:ATTENDEES:    ${e.attendees
-          .map((a) => `${makeMailtoLink(a.cn)} (${a.status})`)
+        `:ATTENDEES:     ${e.attendees
+          .map((a) => `${makeFullName(a.cn)} (${a.status})`)
           .join(", ")}`
       ) && rs.push("\n")
     : null;
   rs.push(":END:\n");
-  rs.push(makeTimestampRange(e.startDate, e.endDate));
-  rs.push("\n");
-  e.description ? rs.push(`\n${e.description}\n`) : null;
+  if (isRoam) {
+    rs.push(`#+title: ${e.summary}\n`);
+  } else {
+    rs.push(makeTimestampRange(e.startDate, e.endDate));
+    rs.push("\n");
+    e.description && rs.push(`\n${e.description}\n`);
+  }
 }
 
 /**
@@ -329,6 +354,24 @@ function createOrgFile(config, events) {
   }
 }
 
+function createRoamFile(config, event) {
+  try {
+    const timestamp = moment(event.startDate).format("YYYYMMDDhhmmss");
+    const slug = event.summary.replace(/[\W_]+/g,"_").toLowerCase();
+    const filename = path.join(config.ROAM_PATH, `${timestamp}-${slug}.org`);
+    let of = fs.createWriteStream(filename, {
+      encoding: "utf-8",
+      flags: "w",
+    });
+    let rs = new Readable();
+    dumpEvent(event, rs, true);
+    rs.push(null);
+    rs.pipe(of);
+  } catch (err) {
+    throw new Error(`createOrgFile: ${err.message}`);
+  }
+}
+
 /**
  * @async
  *
@@ -349,12 +392,50 @@ async function getIcsData(source) {
       data = await resp.text();
     } else {
       // assume is a file name
-      data = fs.readFileSync(source, "utf-8");
+      data = await fs.promises.readFile(source, "utf-8");
     }
     return data;
   } catch (err) {
     throw new Error(`getIcsData: ${err.message}`);
   }
+}
+
+async function writeToDailyFile(config, event) {
+  const timestamp = moment(event.startDate).format("YYYY-MM-DD");
+  const filename = path.join(config.DAILY_PATH, `${timestamp}.org`);
+
+  if (!fs.existsSync(filename)) {
+    try {
+      let of = fs.createWriteStream(filename, {
+        encoding: "utf-8",
+        flags: "w",
+      });
+
+      of.write(`:PROPERTIES:
+:ID:       ${v4()}
+:END:
+#+title: ${timestamp}
+* Daily Log for: ${timestamp}
+** Calendar Events
+`);
+      of.end();
+    } catch(err) {
+      throw new Error(`writeToDailyFile: ${err.message}`);
+    }
+  }
+
+  try {
+      let of = fs.createWriteStream(filename, {
+        encoding: "utf-8",
+        flags: "a",
+      });
+
+      of.write(`- [[id:${event.id}][${event.summary}]]\n`);
+      of.write(`  ${makeTimestampRange(event.startDate, event.endDate)}\n`);
+      of.end();
+    } catch (err) {
+      throw new Error(`writeToDailyFile: ${err.message}`);
+    }
 }
 
 /**
@@ -372,6 +453,8 @@ async function main() {
       RC_FILE: RC,
       ICS_FILE: argv.i || process.env.ICS_FILE,
       ORG_FILE: argv.o || process.env.ORG_FILE,
+      ROAM_PATH: argv.r || process.env.ROAM_PATH,
+      DAILY_PATH: argv.d || process.env.DAILY_PATH,
       TITLE: process.env.TITLE || "Calendar",
       AUTHOR: argv.a || process.env.AUTHOR,
       EMAIL: argv.e || process.env.EMAIL,
@@ -414,11 +497,19 @@ async function main() {
       config.EMAIL
     );
     let allEvents = [...mappedEvents, ...mappedOccurrences];
+    allEvents = allEvents.map(e => {
+      e.id = v4();
+      return e;
+    });
     createOrgFile(config, allEvents);
+    allEvents.forEach(e => {
+      createRoamFile(config, e);
+      writeToDailyFile(config, e);
+    });
     console.log(
       `Generated new org file in ${config.ORG_FILE} with ${allEvents.length} entries`
-    );
-  } catch (err) {
+      );
+    } catch (err) {
     throw new Error(`main: ${err.message}`);
   }
 }
