@@ -5,13 +5,33 @@ import { promises, WriteStream } from 'fs';
 import { capitalize } from 'lodash';
 import { DateTime } from 'luxon';
 
-import { Attendee, Event, Occurence } from './types';
+import {
+  Attendee,
+  Event,
+  ExpanderAttendee,
+  ExpanderEvent,
+  ExpanderOccurence,
+} from './types';
 
+let seen: any[] = [];
 export abstract class IcsorgBase extends Command {
   abstract run(): PromiseLike<any>;
 
-  logJson(value: any) {
-    return this.log(JSON.stringify(value));
+  private deLoop(_: any, value: any) {
+    if (typeof value === 'object' && value !== null) {
+      if (seen.indexOf(value) !== -1) return;
+      else seen.push(value);
+    }
+    return value;
+  }
+
+  logJson(value: any, pretty = false) {
+    seen = [];
+    if (pretty) {
+      return this.log(JSON.stringify(value, this.deLoop, 2));
+    } else {
+      return this.log(JSON.stringify(value, this.deLoop));
+    }
   }
 
   getConfigFile(flags: any) {
@@ -115,17 +135,23 @@ export abstract class IcsorgBase extends Command {
     return `[[${data}][${data}]]`;
   }
 
-  mapOccurences(occurrences: any, author?: string, email?: string) {
-    const mappedOccurrences = occurrences.map((o: Occurence) => ({
-      startDate: o.startDate.toJSDate(),
-      endDate: o.endDate.toJSDate(),
-      ...this.commonEventProperties(o.item, author, email),
-    }));
+  mapOccurences(
+    occurrences: ExpanderOccurence[],
+    author?: string,
+    email?: string,
+  ): Event[] {
+    const mappedOccurrences = occurrences.map<Event>(
+      (o: ExpanderOccurence) => ({
+        startDate: o.startDate.toJSDate(),
+        endDate: o.endDate.toJSDate(),
+        ...this.commonEventProperties(o.item, author, email),
+      }),
+    );
     return mappedOccurrences;
   }
 
-  mapEvents(events: any, author?: string, email?: string) {
-    const mappedEvents = events.map((e: Event) => ({
+  mapEvents(events: ExpanderEvent[], author?: string, email?: string): Event[] {
+    const mappedEvents = events.map<Event>((e: ExpanderEvent) => ({
       endDate: e.endDate.toJSDate(),
       startDate: e.startDate.toJSDate(),
       ...this.commonEventProperties(e, author, email),
@@ -133,12 +159,10 @@ export abstract class IcsorgBase extends Command {
     return mappedEvents;
   }
 
-  commonEventProperties(e: any, author?: string, email?: string) {
+  commonEventProperties(e: ExpanderEvent, author?: string, email?: string) {
     return {
-      attendees: e.attendees.map(
-        (a: Attendee) => this.parseAttendee(a.jCal[1]),
-        author,
-        email,
+      attendees: e.attendees.map((a: ExpanderAttendee) =>
+        this.parseAttendee(a.jCal[1], author, email),
       ),
       description: e.description,
       duration: e.duration,
